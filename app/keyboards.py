@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from aiogram.types import (CallbackQuery, InlineKeyboardMarkup, KeyboardButton,
-                           ReplyKeyboardMarkup)
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters.callback_data import CallbackData
+from aiogram.types import InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
 class ExerciseCallback(CallbackData, prefix="ex"):
+    session: str
     index: int
     completed: bool
 
@@ -30,13 +30,20 @@ def main_menu_keyboard(plan_label: str = "📅 План на сегодня") ->
     )
 
 
-def exercises_keyboard(exercises: list[dict[str, str | int]], completed: list[bool]) -> InlineKeyboardMarkup:
+def exercises_keyboard(
+    exercises: list[dict[str, str | int]], completed: list[bool], session: str = "main"
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for idx, exercise in enumerate(exercises):
         status = "✅" if completed[idx] else "[ ]"
         label = f"{status} {exercise['name']}"
-        builder.button(text=label, callback_data=ExerciseCallback(index=idx, completed=not completed[idx]))
-    builder.button(text="🚫 Пропустить день", callback_data=ExerciseCallback(index=-1, completed=False))
+        builder.button(
+            text=label,
+            callback_data=ExerciseCallback(session=session, index=idx, completed=not completed[idx]),
+        )
+    builder.button(
+        text="🚫 Пропустить день", callback_data=ExerciseCallback(session=session, index=-1, completed=False)
+    )
     builder.adjust(1)
     return builder.as_markup()
 
@@ -52,7 +59,8 @@ def settings_keyboard(mode: str) -> InlineKeyboardMarkup:
         callback_data=SettingsCallback(action="range"),
     )
     builder.button(text="🌐 Часовой пояс", callback_data=SettingsCallback(action="timezone"))
-    builder.adjust(2, 1)
+    builder.button(text="➕ Доп. задачи", callback_data=SettingsCallback(action="additional"))
+    builder.adjust(2, 1, 1)
     return builder.as_markup()
 
 

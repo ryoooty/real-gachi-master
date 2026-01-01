@@ -52,6 +52,8 @@ def init_db() -> None:
                 age INTEGER,
                 level TEXT,
                 injuries TEXT,
+                plan_start_date TEXT,
+                additional_tasks_count INTEGER DEFAULT 1,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             """,
@@ -61,10 +63,11 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS weekly_plan (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
-                day_of_week TEXT NOT NULL,
+                day_index INTEGER NOT NULL,
+                title TEXT,
                 exercise_list TEXT NOT NULL,
                 is_rest_day INTEGER DEFAULT 0,
-                UNIQUE(user_id, day_of_week)
+                UNIQUE(user_id, day_index)
             );
             """,
         )
@@ -81,6 +84,15 @@ def init_db() -> None:
             );
             """,
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS additional_exercises (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL UNIQUE,
+                exercise_list TEXT NOT NULL
+            );
+            """,
+        )
         # migrations for existing databases
         _ensure_column(conn, "users", "notify_range_start_utc", "TEXT")
         _ensure_column(conn, "users", "notify_range_end_utc", "TEXT")
@@ -89,6 +101,10 @@ def init_db() -> None:
         _ensure_column(conn, "users", "notify_range_start_utc_iso", "TEXT")
         _ensure_column(conn, "users", "notify_range_end_utc_iso", "TEXT")
         _ensure_column(conn, "users", "nickname", "TEXT")
+        _ensure_column(conn, "users", "plan_start_date", "TEXT")
+        _ensure_column(conn, "users", "additional_tasks_count", "INTEGER DEFAULT 1")
+        _ensure_column(conn, "weekly_plan", "title", "TEXT")
+        _ensure_column(conn, "weekly_plan", "day_index", "INTEGER")
 
 
 def upsert_user(chat_id: int, **kwargs: Any) -> None:
@@ -103,6 +119,15 @@ def upsert_user(chat_id: int, **kwargs: Any) -> None:
             values = list(kwargs.values())
             values.append(chat_id)
             cursor.execute(f"UPDATE users SET {keys} WHERE chat_id = ?", values)
+
+
+def update_additional_count(chat_id: int, count: int) -> None:
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET additional_tasks_count = ? WHERE chat_id = ?",
+            (count, chat_id),
+        )
 
 
 def get_user(chat_id: int) -> Optional[sqlite3.Row]:
@@ -134,9 +159,9 @@ def save_weekly_plan(user_id: int, plan: Dict[str, Any]) -> None:
             payload = exercises if is_rest else exercises
             cursor.execute(
                 """
-                INSERT INTO weekly_plan (user_id, day_of_week, exercise_list, is_rest_day)
+                INSERT INTO weekly_plan (user_id, day_index, exercise_list, is_rest_day)
                 VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id, day_of_week) DO UPDATE SET
+                ON CONFLICT(user_id, day_index) DO UPDATE SET
                     exercise_list = excluded.exercise_list,
                     is_rest_day = excluded.is_rest_day
                 """,
@@ -144,19 +169,89 @@ def save_weekly_plan(user_id: int, plan: Dict[str, Any]) -> None:
             )
 
 
-def get_plan_for_day(user_id: int, day_of_week: str) -> Optional[Tuple[bool, List[Dict[str, Any]]]]:
+def replace_plan(user_id: int, plan: List[Dict[str, Any]], start_date: dt.date) -> None:
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM weekly_plan WHERE user_id = ?", (user_id,))
+        for item in plan:
+            cursor.execute(
+                """
+                INSERT INTO weekly_plan (user_id, day_index, title, exercise_list, is_rest_day)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    item["day_index"],
+                    item.get("title"),
+                    json.dumps(item.get("exercises", [])),
+                    1 if item.get("is_rest") else 0,
+                ),
+            )
+        cursor.execute(
+            "UPDATE users SET plan_start_date = ? WHERE id = ?",
+            (start_date.isoformat(), user_id),
+        )
+
+
+def save_additional_exercises(user_id: int, exercises: List[Dict[str, Any]]) -> None:
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT exercise_list, is_rest_day FROM weekly_plan WHERE user_id = ? AND day_of_week = ?",
-            (user_id, day_of_week),
+            """
+            INSERT INTO additional_exercises (user_id, exercise_list)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET exercise_list = excluded.exercise_list
+            """,
+            (user_id, json.dumps(exercises)),
+        )
+
+
+def plan_length(user_id: int) -> int:
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM weekly_plan WHERE user_id = ?", (user_id,))
+        res = cursor.fetchone()[0]
+        return int(res or 0)
+
+
+def get_plan_day(user_id: int, day_index: int) -> Optional[Tuple[bool, List[Dict[str, Any]], Optional[str]]]:
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT exercise_list, is_rest_day, title FROM weekly_plan WHERE user_id = ? AND day_index = ?",
+            (user_id, day_index),
         )
         row = cursor.fetchone()
         if row is None:
             return None
         if row[1]:
-            return True, []
-        return False, json.loads(row[0])
+            return True, [], row[2]
+        return False, json.loads(row[0]), row[2]
+
+
+def get_plan_for_date(user_id: int, target_date: dt.date, start_date: Optional[str]) -> Optional[Tuple[bool, List[Dict[str, Any]], Optional[str]]]:
+    total_days = plan_length(user_id)
+    if total_days == 0:
+        return None
+    if start_date:
+        start_dt = dt.date.fromisoformat(start_date)
+    else:
+        start_dt = target_date
+    delta = (target_date - start_dt).days
+    index = (delta % total_days) + 1
+    return get_plan_day(user_id, index)
+
+
+def get_additional_exercises(user_id: int) -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT exercise_list FROM additional_exercises WHERE user_id = ?", (user_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return []
+        return json.loads(row[0])
 
 
 def update_daily_log(
