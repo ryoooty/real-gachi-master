@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, TelegramObject
+from aiogram.types import CallbackQuery, Message, TelegramObject, ReplyKeyboardMarkup
 from aiogram import BaseMiddleware
 import pytz
 from apscheduler.triggers.cron import CronTrigger
@@ -23,9 +23,13 @@ from app import ai, database
 from app.keyboards import (
     DifficultyCallback,
     ExerciseCallback,
+    ProfileCallback,
+    SettingsCallback,
     difficulty_keyboard,
     exercises_keyboard,
     main_menu_keyboard,
+    profile_keyboard,
+    settings_keyboard,
 )
 from app.scheduler import WorkoutScheduler
 from app.time_utils import convert_local_time_to_utc, convert_range_to_utc
@@ -57,6 +61,7 @@ class AccessMiddleware(BaseMiddleware):
 
 
 class ProfileStates(StatesGroup):
+    nickname = State()
     weight = State()
     height = State()
     age = State()
@@ -65,7 +70,6 @@ class ProfileStates(StatesGroup):
 
 
 class SettingsStates(StatesGroup):
-    waiting_mode = State()
     fixed_time = State()
     range_start = State()
     range_end = State()
@@ -97,9 +101,17 @@ def compose_workout_text(date: dt.date, exercises: List[Dict[str, Any]]) -> str:
 
 def ensure_profile(message: Message) -> Optional[sqlite3.Row]:
     user = database.get_user(message.chat.id)
+    derived_name = (
+        message.from_user.full_name
+        or message.from_user.username
+        or (str(message.from_user.id) if message.from_user else None)
+    )
     if user:
+        if user["nickname"] is None and derived_name:
+            database.upsert_user(message.chat.id, nickname=derived_name)
+            user = database.get_user(message.chat.id)
         return user
-    database.upsert_user(message.chat.id)
+    database.upsert_user(message.chat.id, nickname=derived_name)
     return database.get_user(message.chat.id)
 
 
@@ -120,18 +132,70 @@ def validate_time(text: str) -> bool:
 
 def profile_ready(user: sqlite3.Row) -> bool:
     record = dict(user)
-    return all(record.get(field) is not None for field in ("weight", "height", "age", "level", "injuries"))
+    return all(
+        record.get(field) is not None for field in ("nickname", "weight", "height", "age", "level", "injuries")
+    )
 
 
-def profile_summary(user: sqlite3.Row) -> str:
+def plan_button_label(user_id: Optional[int]) -> str:
+    if not user_id:
+        return "📅 План на сегодня"
+    today = dt.date.today().isoformat()
+    log = database.load_daily_log(user_id=user_id, date=today)
+    if log and log.get("points"):
+        return "💪 Доп тренировка"
+    return "📅 План на сегодня"
+
+
+def format_profile(user: sqlite3.Row) -> str:
+    streak = calculate_streak(user["id"])
+    total_points_value = database.total_points(user["id"])
+    completed_days = len(database.completion_dates(user["id"]))
+    nickname = user["nickname"] or f"User {user['chat_id']}"
     return (
-        "Твой профиль:\n"
-        f"Вес: {user['weight']} кг\n"
-        f"Рост: {user['height']} см\n"
-        f"Возраст: {user['age']}\n"
-        f"Уровень: {user['level']}\n"
+        f"{nickname}\n\n"
+        f"Вин-стрик: {streak} дней\n"
+        f"Всего выполнено дней: {completed_days}\n"
+        f"Очки: {total_points_value}\n"
         f"Ограничения: {user['injuries'] or 'нет'}"
     )
+
+
+def menu_for_user(user: Optional[sqlite3.Row]) -> ReplyKeyboardMarkup:
+    user_id = user["id"] if user else None
+    return main_menu_keyboard(plan_label=plan_button_label(user_id))
+
+
+def _display_time(iso_value: Optional[str], fallback: Optional[str], timezone: str) -> str:
+    if iso_value:
+        dt_obj = dt.datetime.fromisoformat(iso_value)
+        local = dt_obj.astimezone(pytz.timezone(timezone))
+        return local.strftime("%H:%M")
+    if fallback:
+        return fallback
+    return "—"
+
+
+def settings_overview(user: sqlite3.Row) -> str:
+    mode = user["notify_mode"] or "fixed"
+    timezone = user["timezone"] or "UTC"
+    if mode == "range":
+        start_local = _display_time(user["notify_range_start_utc_iso"], user["notify_range_start_utc"], timezone)
+        end_local = _display_time(user["notify_range_end_utc_iso"], user["notify_range_end_utc"], timezone)
+        timing = f"Диапазон: {start_local} - {end_local}"
+    else:
+        fixed_local = _display_time(user["notify_time_utc_iso"], user["notify_time_utc"], timezone)
+        timing = f"Точное время: {fixed_local}"
+    return f"{timing}\nЧасовой пояс: {timezone}"
+
+
+async def send_settings(message: Message | CallbackQuery, user: sqlite3.Row) -> None:
+    text = settings_overview(user) + "\n\nВыбери режим:"
+    markup = settings_keyboard(user["notify_mode"] or "fixed")
+    if isinstance(message, CallbackQuery):
+        await message.message.edit_text(text, reply_markup=markup)
+    else:
+        await message.answer(text, reply_markup=markup)
 
 
 def calculate_streak(user_id: int) -> int:
@@ -201,31 +265,83 @@ async def start(message: Message, state: FSMContext, scheduler: WorkoutScheduler
         now_utc = dt.datetime.now(dt.timezone.utc)
         database.upsert_user(
             message.chat.id,
+            nickname=message.from_user.full_name
+            or message.from_user.username
+            or (str(message.from_user.id) if message.from_user else None),
             notify_time_utc=now_utc.strftime("%H:%M"),
             notify_time_utc_iso=now_utc.isoformat(),
         )
     await state.clear()
     await message.answer(
         "Привет! Я помогу планировать тренировки. Используй меню ниже, чтобы начать.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=menu_for_user(database.get_user(message.chat.id)),
     )
     user = database.get_user(message.chat.id)
     if user:
         _schedule_user_from_row(scheduler, user)
 
 
-@router.message(StateFilter("*"), F.text.in_({"👤 Мой Профиль", "✏️ Изменить профиль"}))
-async def edit_profile(message: Message, state: FSMContext) -> None:
-    await state.clear()
+@router.message(StateFilter("*"), F.text.in_({"👤 Профиль", "👤 Мой Профиль"}))
+async def show_profile(message: Message, state: FSMContext) -> None:
     user = ensure_profile(message)
-    if user and profile_ready(user) and message.text != "✏️ Изменить профиль":
-        await message.answer(
-            profile_summary(user)
-            + "\n\nЕсли хочешь обновить данные, нажми '✏️ Изменить профиль' или введи любые новые значения.",
-            reply_markup=main_menu_keyboard(),
-        )
+    if not user:
+        await message.answer("Не удалось загрузить профиль.")
         return
+    if not profile_ready(user):
+        await state.set_state(ProfileStates.nickname)
+        await state.update_data(mode="all")
+        await message.answer("Давай заполним профиль. Как тебя называть?", reply_markup=menu_for_user(user))
+        return
+    await state.clear()
+    await message.answer(format_profile(user), reply_markup=profile_keyboard(user["weight"], user["height"]))
 
+
+@router.callback_query(ProfileCallback.filter())
+async def handle_profile_callback(callback: CallbackQuery, callback_data: ProfileCallback, state: FSMContext) -> None:
+    user = database.get_user(callback.message.chat.id)
+    if not user:
+        await callback.answer("Нет профиля")
+        return
+    await state.clear()
+    if callback_data.action == "all":
+        await state.set_state(ProfileStates.nickname)
+        await state.update_data(mode="all")
+        await callback.message.answer("Обновим профиль. Введи ник:")
+    elif callback_data.action == "weight":
+        await state.set_state(ProfileStates.weight)
+        await state.update_data(mode="single", target="weight")
+        await callback.message.answer("Введи вес (кг):")
+    elif callback_data.action == "height":
+        await state.set_state(ProfileStates.height)
+        await state.update_data(mode="single", target="height")
+        await callback.message.answer("Введи рост (см):")
+    elif callback_data.action == "nickname":
+        await state.set_state(ProfileStates.nickname)
+        await state.update_data(mode="single", target="nickname")
+        await callback.message.answer("Введи ник:")
+    await callback.answer()
+
+
+async def _finish_single_field(message: Message, field: str, value: Any, state: FSMContext) -> None:
+    database.upsert_user(message.chat.id, **{field: value})
+    await state.clear()
+    user = database.get_user(message.chat.id)
+    if user:
+        await message.answer("Данные обновлены.")
+        await message.answer(format_profile(user), reply_markup=profile_keyboard(user["weight"], user["height"]))
+
+
+@router.message(ProfileStates.nickname)
+async def set_nickname(message: Message, state: FSMContext) -> None:
+    nickname = message.text.strip()
+    if not nickname:
+        await message.answer("Нужно ввести ник.")
+        return
+    data = await state.get_data()
+    await state.update_data(nickname=nickname)
+    if data.get("mode") == "single":
+        await _finish_single_field(message, "nickname", nickname, state)
+        return
     await state.set_state(ProfileStates.weight)
     await message.answer("Введи вес (кг):")
 
@@ -236,7 +352,11 @@ async def set_weight(message: Message, state: FSMContext) -> None:
     if weight is None:
         await message.answer("Нужно число. Введи вес (кг):")
         return
+    data = await state.get_data()
     await state.update_data(weight=weight)
+    if data.get("mode") == "single":
+        await _finish_single_field(message, "weight", weight, state)
+        return
     await state.set_state(ProfileStates.height)
     await message.answer("Введи рост (см):")
 
@@ -247,7 +367,11 @@ async def set_height(message: Message, state: FSMContext) -> None:
     if height is None:
         await message.answer("Нужно число. Введи рост (см):")
         return
+    data = await state.get_data()
     await state.update_data(height=height)
+    if data.get("mode") == "single":
+        await _finish_single_field(message, "height", height, state)
+        return
     await state.set_state(ProfileStates.age)
     await message.answer("Введи возраст:")
 
@@ -260,7 +384,7 @@ async def set_age(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(age=age)
     await state.set_state(ProfileStates.level)
-    await message.answer("Укажи уровень (Новичок/Про):")
+    await message.answer("Укажи уровень (Новичок или Про). Если не нужен, напиши 'не нужен'.")
 
 
 @router.message(ProfileStates.level)
@@ -276,6 +400,7 @@ async def finish_profile(message: Message, state: FSMContext) -> None:
     data["injuries"] = message.text
     database.upsert_user(
         message.chat.id,
+        nickname=data.get("nickname"),
         weight=data.get("weight"),
         height=data.get("height"),
         age=data.get("age"),
@@ -283,39 +408,38 @@ async def finish_profile(message: Message, state: FSMContext) -> None:
         injuries=data.get("injuries"),
     )
     await state.clear()
-    await message.answer("Профиль обновлен!", reply_markup=main_menu_keyboard())
+    user = database.get_user(message.chat.id)
+    if user:
+        await message.answer("Профиль обновлен!", reply_markup=menu_for_user(user))
+        await message.answer(format_profile(user), reply_markup=profile_keyboard(user["weight"], user["height"]))
 
 
 @router.message(StateFilter("*"), F.text == "⚙️ Настройки")
 async def settings_entry(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await state.set_state(SettingsStates.waiting_mode)
-    await message.answer(
-        "Выбери режим уведомлений: напиши 'Точное время' или 'Диапазон'.\n"
-        "Или отправь 'Часовой пояс' для смены часового пояса (пример: Europe/Moscow)."
-    )
-
-
-@router.message(SettingsStates.waiting_mode)
-async def choose_mode(message: Message, state: FSMContext, scheduler: WorkoutScheduler) -> None:
-    text = message.text.lower()
     user = ensure_profile(message)
     if not user:
         await message.answer("Сначала создай профиль.")
         return
-    if "часовой" in text:
+    await send_settings(message, user)
+
+
+@router.callback_query(SettingsCallback.filter())
+async def handle_settings_callback(callback: CallbackQuery, callback_data: SettingsCallback, state: FSMContext) -> None:
+    user = database.get_user(callback.message.chat.id)
+    if not user:
+        await callback.answer("Нет профиля")
+        return
+    if callback_data.action == "timezone":
         await state.set_state(SettingsStates.timezone)
-        await message.answer("Введи таймзону, например Europe/Moscow")
-        return
-    if "точное" in text:
+        await callback.message.answer("Введи таймзону, например Europe/Moscow")
+    elif callback_data.action == "fixed":
         await state.set_state(SettingsStates.fixed_time)
-        await message.answer("Введи время HH:MM")
-        return
-    if "диапазон" in text:
+        await callback.message.answer("Введи время HH:MM")
+    elif callback_data.action == "range":
         await state.set_state(SettingsStates.range_start)
-        await message.answer("Введи начало диапазона HH:MM")
-        return
-    await message.answer("Не понял. Напиши 'Точное время', 'Диапазон' или 'Часовой пояс'.")
+        await callback.message.answer("Введи начало диапазона HH:MM")
+    await callback.answer()
 
 
 @router.message(SettingsStates.timezone)
@@ -329,7 +453,9 @@ async def set_timezone(message: Message, state: FSMContext) -> None:
         return
     database.upsert_user(message.chat.id, timezone=tz)
     await state.clear()
-    await message.answer("Часовой пояс обновлен.", reply_markup=main_menu_keyboard())
+    user = database.get_user(message.chat.id)
+    if user:
+        await send_settings(message, user)
 
 
 @router.message(SettingsStates.fixed_time)
@@ -355,7 +481,9 @@ async def set_fixed_time(message: Message, state: FSMContext, scheduler: Workout
     )
     _schedule_user_from_row(scheduler, database.get_user(message.chat.id))
     await state.clear()
-    await message.answer(f"Время сохранено (UTC {utc_time}).", reply_markup=main_menu_keyboard())
+    user = database.get_user(message.chat.id)
+    if user:
+        await send_settings(message, user)
 
 
 @router.message(SettingsStates.range_start)
@@ -392,13 +520,12 @@ async def set_range_end(message: Message, state: FSMContext, scheduler: WorkoutS
     )
     _schedule_user_from_row(scheduler, database.get_user(message.chat.id))
     await state.clear()
-    await message.answer(
-        f"Диапазон сохранен (UTC {start_utc}-{end_utc}).",
-        reply_markup=main_menu_keyboard(),
-    )
+    user = database.get_user(message.chat.id)
+    if user:
+        await send_settings(message, user)
 
 
-@router.message(StateFilter("*"), F.text == "📅 План на сегодня")
+@router.message(StateFilter("*"), F.text.in_({"📅 План на сегодня", "💪 Доп тренировка"}))
 async def today_plan(message: Message, state: FSMContext) -> None:
     await state.clear()
     user = ensure_profile(message)
@@ -415,7 +542,7 @@ async def today_plan(message: Message, state: FSMContext) -> None:
     if existing_log and existing_log.get("exercises_done"):
         exercises = existing_log["exercises_done"]
     if existing_log and existing_log.get("points"):
-        await message.answer("Тренировка за сегодня уже сохранена.", reply_markup=main_menu_keyboard())
+        await message.answer("Тренировка за сегодня уже сохранена.", reply_markup=menu_for_user(user))
         return
     if plan is None:
         await message.answer("План кончился! Выполняем запасную тренировку.")
@@ -502,6 +629,7 @@ async def handle_difficulty_callback(callback: CallbackQuery, callback_data: Dif
         points=points,
     )
     await callback.message.edit_text("Сложность сохранена, очки начислены!")
+    await callback.message.answer("Меню обновлено.", reply_markup=menu_for_user(user))
     await callback.answer("Спасибо за отзыв")
 
 
@@ -516,12 +644,26 @@ async def show_stats(message: Message, state: FSMContext) -> None:
     streak = calculate_streak(user["id"])
     max_streak = calculate_max_streak(user["id"])
     completed_days = len(database.completion_dates(user["id"]))
-    leaders = database.leaderboard()
-    leaderboard_text = "\n".join([f"{idx+1}. {item[0]} — {item[1]} очков" for idx, item in enumerate(leaders)]) or "Нет данных"
+    leaders = []
+    for other in database.list_users():
+        points = database.total_points(other["id"])
+        win_streak = calculate_streak(other["id"])
+        name = other["nickname"] or str(other["chat_id"])
+        leaders.append((name, points, win_streak))
+    leaders.sort(key=lambda item: item[1], reverse=True)
+    leaderboard_text = (
+        "\n".join(
+            [
+                f"{idx+1}. {name} — {points} очков, стрик {streak_value}"
+                for idx, (name, points, streak_value) in enumerate(leaders)
+            ]
+        )
+        or "Нет данных"
+    )
     await message.answer(
         f"Очки: {total}\nСтрик: {streak} дней (рекорд {max_streak})\n"
         f"Выполнено дней: {completed_days}\nЛидерборд:\n{leaderboard_text}",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=menu_for_user(user),
     )
 
 

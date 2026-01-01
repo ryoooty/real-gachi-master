@@ -38,6 +38,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER UNIQUE,
+                nickname TEXT,
                 notify_time_utc TEXT,
                 notify_time_utc_iso TEXT,
                 notify_range_start_utc TEXT,
@@ -87,6 +88,7 @@ def init_db() -> None:
         _ensure_column(conn, "users", "notify_time_utc_iso", "TEXT")
         _ensure_column(conn, "users", "notify_range_start_utc_iso", "TEXT")
         _ensure_column(conn, "users", "notify_range_end_utc_iso", "TEXT")
+        _ensure_column(conn, "users", "nickname", "TEXT")
 
 
 def upsert_user(chat_id: int, **kwargs: Any) -> None:
@@ -258,17 +260,17 @@ def completion_dates(user_id: int) -> List[str]:
         return [row[0] for row in cursor.fetchall()]
 
 
-def leaderboard() -> List[tuple[int, int]]:
+def leaderboard() -> List[tuple[int, int, str | None]]:
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT chat_id, COALESCE(SUM(points),0) as pts
+            SELECT chat_id, COALESCE(SUM(points),0) as pts, users.nickname
             FROM daily_logs
             JOIN users ON users.id = daily_logs.user_id
             GROUP BY chat_id
             ORDER BY pts DESC
             """
         )
-        return [(row[0], row[1]) for row in cursor.fetchall()]
+        return [(row[0], row[1], row[2]) for row in cursor.fetchall()]
 
