@@ -304,6 +304,20 @@ def calculate_max_streak(user_id: int) -> int:
     return best
 
 
+def pluralize_days(value: int) -> str:
+    last_two = abs(value) % 100
+    last_one = abs(value) % 10
+    if 11 <= last_two <= 14:
+        suffix = "дней"
+    elif last_one == 1:
+        suffix = "день"
+    elif 2 <= last_one <= 4:
+        suffix = "дня"
+    else:
+        suffix = "дней"
+    return f"{value} {suffix}"
+
+
 def close_previous_day_if_pending(user_id: int, today: dt.date) -> None:
     yesterday = today - dt.timedelta(days=1)
     previous_log = database.load_daily_log(user_id=user_id, date=yesterday.isoformat())
@@ -795,15 +809,17 @@ async def show_stats(message: Message, state: FSMContext) -> None:
         name = other["nickname"] or str(other["chat_id"])
         leaders.append((name, points, win_streak))
     leaders.sort(key=lambda item: item[1], reverse=True)
-    leaderboard_text = (
-        "\n".join(
-            [
-                f"{idx+1}. {name} — {points} очков, стрик {streak_value}"
-                for idx, (name, points, streak_value) in enumerate(leaders)
-            ]
+    if leaders:
+        best_name, best_points, best_streak = leaders[0]
+        worst_name, worst_points, worst_streak = leaders[-1]
+        leaderboard_text = (
+            "❤️🤙🎉🙏Самый крутой🙏🎉🤙❤️:\n\n"
+            f"🥇{best_name} - {best_points}🍭 - {pluralize_days(best_streak)} подряд\n\n"
+            "Вообще не крутой👎👎👎👎:\n\n"
+            f"🗑{worst_name} - {worst_points}🍭 - {pluralize_days(worst_streak)} подряд"
         )
-        or "Нет данных"
-    )
+    else:
+        leaderboard_text = "Нет данных"
     await message.answer(
         f"Очки: {total}\nСтрик: {streak} дней (рекорд {max_streak})\n"
         f"Выполнено дней: {completed_days}\nЛидерборд:\n{leaderboard_text}",
