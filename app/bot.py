@@ -7,6 +7,7 @@ import sqlite3
 from typing import Any, Dict, List, Optional
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
@@ -518,7 +519,10 @@ async def generate_all(bot: Bot) -> None:
 
 async def main() -> None:
     database.init_db()
-    bot = Bot(token=os.getenv("BOT_TOKEN", "DUMMY"), parse_mode=ParseMode.HTML)
+    bot = Bot(
+        token=os.getenv("BOT_TOKEN", "DUMMY"),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     dp = Dispatcher()
     scheduler = WorkoutScheduler(lambda chat_id: scheduled_push(bot, chat_id))
     dp.update.middleware(AccessMiddleware())
