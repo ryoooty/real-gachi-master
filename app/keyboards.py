@@ -20,6 +20,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📅 План на сегодня"), KeyboardButton(text="📈 Статистика")],
             [KeyboardButton(text="👤 Мой Профиль"), KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="✏️ Изменить профиль")],
         ],
         resize_keyboard=True,
     )
