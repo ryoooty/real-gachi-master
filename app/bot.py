@@ -118,20 +118,68 @@ def validate_time(text: str) -> bool:
         return False
 
 
+def profile_ready(user: sqlite3.Row) -> bool:
+    record = dict(user)
+    return all(record.get(field) is not None for field in ("weight", "height", "age", "level", "injuries"))
+
+
+def profile_summary(user: sqlite3.Row) -> str:
+    return (
+        "Твой профиль:\n"
+        f"Вес: {user['weight']} кг\n"
+        f"Рост: {user['height']} см\n"
+        f"Возраст: {user['age']}\n"
+        f"Уровень: {user['level']}\n"
+        f"Ограничения: {user['injuries'] or 'нет'}"
+    )
+
+
 def calculate_streak(user_id: int) -> int:
     dates = database.completion_dates(user_id)
     if not dates:
         return 0
     streak = 0
-    expected = dt.date.fromisoformat(dates[0])
+    expected = dt.date.today()
     for d in dates:
         current = dt.date.fromisoformat(d)
         if current == expected:
             streak += 1
             expected = expected - dt.timedelta(days=1)
-        else:
+        elif current < expected:
             break
     return streak
+
+
+def calculate_max_streak(user_id: int) -> int:
+    dates = sorted(database.completion_dates(user_id))
+    best = 0
+    current = 0
+    prev: Optional[dt.date] = None
+    for d in dates:
+        day = dt.date.fromisoformat(d)
+        if prev and (day - prev).days == 1:
+            current += 1
+        else:
+            current = 1
+        best = max(best, current)
+        prev = day
+    return best
+
+
+def close_previous_day_if_pending(user_id: int, today: dt.date) -> None:
+    yesterday = today - dt.timedelta(days=1)
+    previous_log = database.load_daily_log(user_id=user_id, date=yesterday.isoformat())
+    if not previous_log:
+        return
+    if previous_log.get("points"):
+        return
+    database.update_daily_log(
+        user_id=user_id,
+        date=yesterday.isoformat(),
+        exercises_done=previous_log.get("exercises_done", []),
+        difficulty_rate=previous_log.get("difficulty_rate") or "skipped",
+        points=0,
+    )
 
 
 async def safe_send(bot: Bot, chat_id: int, text: str, **kwargs: Any) -> None:
@@ -166,49 +214,20 @@ async def start(message: Message, state: FSMContext, scheduler: WorkoutScheduler
         _schedule_user_from_row(scheduler, user)
 
 
-@router.message(StateFilter("*"), F.text == "👤 Мой Профиль")
-async def profile_entry_with_reset(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await edit_profile(message, state)
-
-
-@router.message(StateFilter("*"), F.text == "📈 Статистика")
-async def stats_with_reset(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await show_stats(message)
-
-
-@router.message(StateFilter("*"), F.text == "📅 План на сегодня")
-async def plan_with_reset(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await today_plan(message)
-
-
-@router.message(StateFilter("*"), F.text == "⚙️ Настройки")
-async def settings_with_reset(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await settings_entry(message, state)
-
-
-@router.message(StateFilter(None), F.text == "👤 Мой Профиль")
+@router.message(StateFilter("*"), F.text.in_({"👤 Мой Профиль", "✏️ Изменить профиль"}))
 async def edit_profile(message: Message, state: FSMContext) -> None:
     await state.clear()
     user = ensure_profile(message)
-    if not user:
-        await message.answer("Сначала создай профиль.")
+    if user and profile_ready(user) and message.text != "✏️ Изменить профиль":
+        await message.answer(
+            profile_summary(user)
+            + "\n\nЕсли хочешь обновить данные, нажми '✏️ Изменить профиль' или введи любые новые значения.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
-    parts = [
-        f"Вес: {user['weight'] or 'не указан'}",
-        f"Рост: {user['height'] or 'не указан'}",
-        f"Возраст: {user['age'] or 'не указан'}",
-        f"Уровень: {user['level'] or 'не указан'}",
-        f"Ограничения: {user['injuries'] or 'не указаны'}",
-    ]
-    summary = "\n".join(parts)
-    await message.answer(
-        "Твой профиль:\n" + summary + "\n\nНажми 'Изменить', чтобы обновить данные.",
-        reply_markup=main_menu_keyboard(),
-    )
+
+    await state.set_state(ProfileStates.weight)
+    await message.answer("Введи вес (кг):")
 
 
 @router.message(ProfileStates.weight)
@@ -267,7 +286,7 @@ async def finish_profile(message: Message, state: FSMContext) -> None:
     await message.answer("Профиль обновлен!", reply_markup=main_menu_keyboard())
 
 
-@router.message(StateFilter(None), F.text == "⚙️ Настройки")
+@router.message(StateFilter("*"), F.text == "⚙️ Настройки")
 async def settings_entry(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(SettingsStates.waiting_mode)
@@ -379,17 +398,25 @@ async def set_range_end(message: Message, state: FSMContext, scheduler: WorkoutS
     )
 
 
-@router.message(StateFilter(None), F.text == "📅 План на сегодня")
-async def today_plan(message: Message) -> None:
+@router.message(StateFilter("*"), F.text == "📅 План на сегодня")
+async def today_plan(message: Message, state: FSMContext) -> None:
+    await state.clear()
     user = ensure_profile(message)
     if not user:
         await message.answer("Сначала создай профиль.")
         return
 
     today = dt.date.today()
+    close_previous_day_if_pending(user["id"], today)
     plan = database.get_plan_for_day(user["id"], weekday_key(today))
     exercises = FALLBACK_WORKOUT if plan is None else plan[1]
     is_rest = False if plan is None else plan[0]
+    existing_log = database.load_daily_log(user_id=user["id"], date=today.isoformat())
+    if existing_log and existing_log.get("exercises_done"):
+        exercises = existing_log["exercises_done"]
+    if existing_log and existing_log.get("points"):
+        await message.answer("Тренировка за сегодня уже сохранена.", reply_markup=main_menu_keyboard())
+        return
     if plan is None:
         await message.answer("План кончился! Выполняем запасную тренировку.")
     if is_rest:
@@ -418,14 +445,17 @@ async def handle_exercise_callback(callback: CallbackQuery, callback_data: Exerc
     completed = [item.get("done", False) for item in exercises]
 
     if callback_data.index == -1:
+        if log.get("points"):
+            await callback.answer("Тренировка уже завершена")
+            return
         text = "День пропущен. Не забывай вернуться завтра!"
         keep_points = log.get("points", 0)
         database.update_daily_log(
             user_id=user["id"],
             date=today.isoformat(),
             exercises_done=exercises,
-            difficulty_rate=log.get("difficulty_rate") or "skipped",
-            points=keep_points,
+            difficulty_rate="skipped",
+            points=0,
         )
         await callback.message.edit_text(text)
         await callback.answer()
@@ -475,20 +505,22 @@ async def handle_difficulty_callback(callback: CallbackQuery, callback_data: Dif
     await callback.answer("Спасибо за отзыв")
 
 
-@router.message(StateFilter(None), F.text == "📈 Статистика")
-async def show_stats(message: Message) -> None:
+@router.message(StateFilter("*"), F.text == "📈 Статистика")
+async def show_stats(message: Message, state: FSMContext) -> None:
+    await state.clear()
     user = ensure_profile(message)
     if not user:
         await message.answer("Сначала профиль.")
         return
     total = database.total_points(user["id"])
     streak = calculate_streak(user["id"])
-    days_done = database.completed_days(user["id"])
-    best = database.max_streak(user["id"])
+    max_streak = calculate_max_streak(user["id"])
+    completed_days = len(database.completion_dates(user["id"]))
     leaders = database.leaderboard()
     leaderboard_text = "\n".join([f"{idx+1}. {item[0]} — {item[1]} очков" for idx, item in enumerate(leaders)]) or "Нет данных"
     await message.answer(
-        f"Очки: {total}\nВыполнено дней всего: {days_done}\nТекущий стрик: {streak} дней\nМакс. стрик: {best} дней\nЛидерборд:\n{leaderboard_text}",
+        f"Очки: {total}\nСтрик: {streak} дней (рекорд {max_streak})\n"
+        f"Выполнено дней: {completed_days}\nЛидерборд:\n{leaderboard_text}",
         reply_markup=main_menu_keyboard(),
     )
 
@@ -527,15 +559,21 @@ async def scheduled_push(bot: Bot, chat_id: int) -> None:
     if not user:
         return
     today = dt.date.today()
+    close_previous_day_if_pending(user["id"], today)
     plan = database.get_plan_for_day(user["id"], weekday_key(today))
+    existing_log = database.load_daily_log(user_id=user["id"], date=today.isoformat())
     if plan is None:
         await safe_send(bot, chat_id, "План кончился! Жми кнопку генерации или выполняй запасную тренировку.")
-        exercises = FALLBACK_WORKOUT
+        exercises = existing_log["exercises_done"] if existing_log and existing_log.get("exercises_done") else FALLBACK_WORKOUT
     else:
         is_rest, exercises = plan
+        if existing_log and existing_log.get("exercises_done"):
+            exercises = existing_log["exercises_done"]
         if is_rest:
             await safe_send(bot, chat_id, "Сегодня отдых, восстанавливай силы!")
             return
+    if existing_log and existing_log.get("points"):
+        return
     completed = [ex.get("done", False) for ex in exercises]
     database.update_daily_log(user_id=user["id"], date=today.isoformat(), exercises_done=exercises)
     text = compose_workout_text(today, exercises)

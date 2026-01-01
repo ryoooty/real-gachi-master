@@ -162,18 +162,18 @@ def update_daily_log(
     date: str,
     exercises_done: List[Dict[str, Any]],
     difficulty_rate: Optional[str] = None,
-    points: int = 0,
+    points: Optional[int] = None,
 ) -> None:
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
             INSERT INTO daily_logs (user_id, date, exercises_done, difficulty_rate, points)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, COALESCE(?, 0))
             ON CONFLICT(user_id, date) DO UPDATE SET
                 exercises_done = excluded.exercises_done,
                 difficulty_rate = COALESCE(excluded.difficulty_rate, daily_logs.difficulty_rate),
-                points = excluded.points
+                points = COALESCE(excluded.points, daily_logs.points)
             """,
             (user_id, date, json.dumps(exercises_done), difficulty_rate, points),
         )
