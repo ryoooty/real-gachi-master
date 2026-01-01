@@ -4,6 +4,7 @@ import datetime as dt
 import random
 from typing import Awaitable, Callable, Optional
 
+import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -13,23 +14,23 @@ from app.time_utils import convert_local_time_to_utc, convert_range_to_utc
 
 class WorkoutScheduler:
     def __init__(self, on_trigger: Callable[[int], Awaitable[None]]):
-        self.scheduler = AsyncIOScheduler(timezone=dt.timezone.utc)
+        self.scheduler = AsyncIOScheduler(timezone=pytz.UTC)
         self.on_trigger = on_trigger
 
     def schedule_fixed(self, chat_id: int, local_time: str, timezone: str | None = None) -> None:
         utc_time = convert_local_time_to_utc(local_time, timezone)
         hour, minute = map(int, utc_time.split(":"))
-        trigger = CronTrigger(hour=hour, minute=minute, timezone=dt.timezone.utc)
+        trigger = CronTrigger(hour=hour, minute=minute, timezone=pytz.UTC)
         self.scheduler.add_job(self._wrap(chat_id, mode="fixed"), trigger, id=f"notify-{chat_id}", replace_existing=True)
 
     def _range_job(self, chat_id: int, start_utc: str, end_utc: str) -> None:
         start_hour, start_min = map(int, start_utc.split(":"))
         end_hour, end_min = map(int, end_utc.split(":"))
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(pytz.UTC)
         today = now.date()
 
-        start_dt = dt.datetime.combine(today, dt.time(start_hour, start_min, tzinfo=dt.timezone.utc))
-        end_dt = dt.datetime.combine(today, dt.time(end_hour, end_min, tzinfo=dt.timezone.utc))
+        start_dt = dt.datetime.combine(today, dt.time(start_hour, start_min, tzinfo=pytz.UTC))
+        end_dt = dt.datetime.combine(today, dt.time(end_hour, end_min, tzinfo=pytz.UTC))
         if end_dt <= start_dt:
             end_dt += dt.timedelta(days=1)
 
