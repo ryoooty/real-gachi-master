@@ -26,7 +26,7 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
     cursor.execute("PRAGMA table_info(%s)" % table)
     columns = {row[1] for row in cursor.fetchall()}
     if column not in columns:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def init_db() -> None:
