@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import io
 import os
+import random
 import sqlite3
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -69,6 +71,11 @@ class SettingsStates(StatesGroup):
     range_start = State()
     range_end = State()
     timezone = State()
+    additional_count = State()
+
+
+class PlanStates(StatesGroup):
+    file_upload = State()
 
 
 def human_day_name(date: dt.date) -> str:
@@ -123,6 +130,78 @@ def validate_time(text: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _log_exercises(log: Dict[str, Any] | None, session: str = "main") -> List[Dict[str, Any]]:
+    if not log:
+        return []
+    exercises = log.get("exercises_done", [])
+    if isinstance(exercises, dict):
+        return list(exercises.get(session, []))
+    if session == "main":
+        return list(exercises)
+    return []
+
+
+def _store_log_exercises(
+    log: Dict[str, Any] | None, session: str, exercises: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    existing = log.get("exercises_done") if log else {}
+    if not isinstance(existing, dict):
+        existing = {"main": existing or []}
+    existing[session] = exercises
+    return existing
+
+
+def _parse_exercise_line(line: str) -> Optional[Dict[str, Any]]:
+    parts = [segment.strip() for segment in line.replace("—", "-").split("-")]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return None
+    name = parts[0]
+    reps = parts[1]
+    points = parse_int(parts[2]) if len(parts) > 2 else None
+    exercise: Dict[str, Any] = {"name": name}
+    if reps.endswith("м"):
+        exercise["meters"] = reps
+    elif reps.endswith("с"):
+        exercise["seconds"] = parse_int(reps[:-1]) or reps
+    else:
+        exercise["reps"] = parse_int(reps) or reps
+    if points is not None:
+        exercise["points"] = points
+    return exercise
+
+
+def parse_plan_content(content: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    plan_days: List[Dict[str, Any]] = []
+    additional: List[Dict[str, Any]] = []
+    idx = 0
+    while idx < len(lines):
+        if not lines[idx].isdigit():
+            break
+        day_number = int(lines[idx])
+        idx += 1
+        if idx >= len(lines):
+            break
+        if day_number == 0:
+            while idx < len(lines):
+                exercise = _parse_exercise_line(lines[idx])
+                if exercise:
+                    additional.append(exercise)
+                idx += 1
+            break
+        title = lines[idx]
+        idx += 1
+        exercises: List[Dict[str, Any]] = []
+        while idx < len(lines) and not lines[idx].isdigit():
+            exercise = _parse_exercise_line(lines[idx])
+            if exercise:
+                exercises.append(exercise)
+            idx += 1
+        plan_days.append({"day_index": day_number, "title": title, "exercises": exercises})
+    return plan_days, additional
 
 
 def profile_ready(user: sqlite3.Row) -> bool:
@@ -180,7 +259,8 @@ def settings_overview(user: sqlite3.Row) -> str:
     else:
         fixed_local = _display_time(user["notify_time_utc_iso"], user["notify_time_utc"], timezone)
         timing = f"Точное время: {fixed_local}"
-    return f"{timing}\nЧасовой пояс: {timezone}"
+    additional_count = user["additional_tasks_count"] or 1
+    return f"{timing}\nЧасовой пояс: {timezone}\nДоп. заданий: {additional_count}"
 
 
 async def send_settings(message: Message | CallbackQuery, user: sqlite3.Row) -> None:
@@ -273,6 +353,47 @@ async def start(message: Message, state: FSMContext, scheduler: WorkoutScheduler
     user = database.get_user(message.chat.id)
     if user:
         _schedule_user_from_row(scheduler, user)
+
+
+@router.message(Command("plan"))
+async def request_plan_file(message: Message, state: FSMContext) -> None:
+    await state.set_state(PlanStates.file_upload)
+    await message.answer(
+        "Пришли .txt файл с планом тренировок.\n"
+        "Формат: номер дня, название, затем упражнения через дефис."
+    )
+
+
+@router.message(PlanStates.file_upload)
+async def handle_plan_file(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not message.document:
+        await message.answer("Нужен .txt файл с планом.")
+        return
+    buffer = io.BytesIO()
+    await message.document.download(destination=buffer)
+    try:
+        content = buffer.getvalue().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        await message.answer("Не удалось прочитать файл, нужна UTF-8 кодировка.")
+        return
+
+    plan_days, extras = parse_plan_content(content)
+    if not plan_days:
+        await message.answer("Не найдено ни одного дня плана.")
+        return
+
+    user = ensure_profile(message)
+    if not user:
+        await message.answer("Сначала создай профиль.")
+        return
+
+    database.replace_plan(user_id=user["id"], plan=plan_days, start_date=dt.date.today())
+    database.save_additional_exercises(user_id=user["id"], exercises=extras)
+    await state.clear()
+    await message.answer(
+        f"План из {len(plan_days)} дней сохранен. Доп. упражнений: {len(extras)}.",
+        reply_markup=menu_for_user(user),
+    )
 
 
 @router.message(StateFilter("*"), F.text.in_({"👤 Профиль", "👤 Мой Профиль"}))
@@ -417,6 +538,9 @@ async def handle_settings_callback(callback: CallbackQuery, callback_data: Setti
     elif callback_data.action == "range":
         await state.set_state(SettingsStates.range_start)
         await callback.message.answer("Введи начало диапазона HH:MM")
+    elif callback_data.action == "additional":
+        await state.set_state(SettingsStates.additional_count)
+        await callback.message.answer("Сколько доп. задач выбирать? Введи число")
     await callback.answer()
 
 
@@ -503,6 +627,19 @@ async def set_range_end(message: Message, state: FSMContext, scheduler: WorkoutS
         await send_settings(message, user)
 
 
+@router.message(SettingsStates.additional_count)
+async def set_additional_count(message: Message, state: FSMContext) -> None:
+    count = parse_int(message.text)
+    if count is None or count <= 0:
+        await message.answer("Нужно положительное число.")
+        return
+    database.update_additional_count(message.chat.id, count)
+    await state.clear()
+    user = database.get_user(message.chat.id)
+    if user:
+        await send_settings(message, user)
+
+
 @router.message(StateFilter("*"), F.text.in_({"📅 План на сегодня", "💪 Доп тренировка"}))
 async def today_plan(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -513,12 +650,39 @@ async def today_plan(message: Message, state: FSMContext) -> None:
 
     today = dt.date.today()
     close_previous_day_if_pending(user["id"], today)
-    plan = database.get_plan_for_day(user["id"], weekday_key(today))
+    existing_log = database.load_daily_log(user_id=user["id"], date=today.isoformat())
+    is_additional = message.text == "💪 Доп тренировка"
+
+    if is_additional:
+        exercises = _log_exercises(existing_log, session="additional")
+        if not exercises:
+            extra_pool = database.get_additional_exercises(user["id"])
+            if not extra_pool:
+                await message.answer("Нет доп. упражнений, загрузите их через /plan.")
+                return
+            count = user["additional_tasks_count"] or 1
+            selected = random.sample(extra_pool, k=min(count, len(extra_pool)))
+            for item in selected:
+                item["done"] = False
+            exercises = selected
+            database.update_daily_log(
+                user_id=user["id"],
+                date=today.isoformat(),
+                exercises_done=_store_log_exercises(existing_log, "additional", exercises),
+                points=existing_log.get("points") if existing_log else 0,
+            )
+        completed = [ex.get("done", False) for ex in exercises]
+        text = "Дополнительная тренировка\n\n" + compose_workout_text(today, exercises)
+        await message.answer(text, reply_markup=exercises_keyboard(exercises, completed, session="additional"))
+        return
+
+    plan = database.get_plan_for_date(user_id=user["id"], target_date=today, start_date=user["plan_start_date"])
     exercises = FALLBACK_WORKOUT if plan is None else plan[1]
     is_rest = False if plan is None else plan[0]
-    existing_log = database.load_daily_log(user_id=user["id"], date=today.isoformat())
-    if existing_log and existing_log.get("exercises_done"):
-        exercises = existing_log["exercises_done"]
+    if existing_log:
+        stored = _log_exercises(existing_log, session="main")
+        if stored:
+            exercises = stored
     if existing_log and existing_log.get("points"):
         await message.answer("Тренировка за сегодня уже сохранена.", reply_markup=menu_for_user(user))
         return
@@ -529,9 +693,13 @@ async def today_plan(message: Message, state: FSMContext) -> None:
         return
 
     completed = [ex.get("done", False) for ex in exercises]
-    database.update_daily_log(user_id=user["id"], date=today.isoformat(), exercises_done=exercises)
+    database.update_daily_log(
+        user_id=user["id"],
+        date=today.isoformat(),
+        exercises_done=_store_log_exercises(existing_log, "main", exercises),
+    )
     text = compose_workout_text(today, exercises)
-    await message.answer(text, reply_markup=exercises_keyboard(exercises, completed))
+    await message.answer(text, reply_markup=exercises_keyboard(exercises, completed, session="main"))
 
 
 @router.callback_query(ExerciseCallback.filter())
@@ -546,19 +714,22 @@ async def handle_exercise_callback(callback: CallbackQuery, callback_data: Exerc
         await callback.answer("План не найден")
         return
 
-    exercises = log["exercises_done"]
+    exercises = _log_exercises(log, session=callback_data.session)
     completed = [item.get("done", False) for item in exercises]
 
     if callback_data.index == -1:
+        if callback_data.session == "additional":
+            await callback.message.edit_text("Доп. тренировка отменена.")
+            await callback.answer()
+            return
         if log.get("points"):
             await callback.answer("Тренировка уже завершена")
             return
         text = "День пропущен. Не забывай вернуться завтра!"
-        keep_points = log.get("points", 0)
         database.update_daily_log(
             user_id=user["id"],
             date=today.isoformat(),
-            exercises_done=exercises,
+            exercises_done=_store_log_exercises(log, callback_data.session, exercises),
             difficulty_rate="skipped",
             points=0,
         )
@@ -571,26 +742,38 @@ async def handle_exercise_callback(callback: CallbackQuery, callback_data: Exerc
         exercise["done"] = completed[idx]
 
     all_done = all(completed)
-    database.update_daily_log(user_id=user["id"], date=today.isoformat(), exercises_done=exercises)
+    database.update_daily_log(
+        user_id=user["id"],
+        date=today.isoformat(),
+        exercises_done=_store_log_exercises(log, callback_data.session, exercises),
+    )
 
     if all_done:
-        points = sum(3 if ex.get("name", "").lower().startswith("pull") else 1 for ex in exercises if ex.get("done"))
-        database.update_daily_log(
-            user_id=user["id"],
-            date=today.isoformat(),
-            exercises_done=exercises,
-            difficulty_rate="completed",
-            points=points,
-        )
-        await callback.message.edit_text(
-            f"🎉 Тренировка завершена!\nОчки начислены: {points}"
-        )
+        points = sum(ex.get("points", 1) for ex in exercises if ex.get("done"))
+        if callback_data.session == "additional":
+            database.add_points(user["id"], today.isoformat(), points)
+            await callback.message.edit_text(
+                f"🔥 Доп. тренировка завершена!\nОчки добавлены: {points}"
+            )
+        else:
+            database.update_daily_log(
+                user_id=user["id"],
+                date=today.isoformat(),
+                exercises_done=_store_log_exercises(log, callback_data.session, exercises),
+                difficulty_rate="completed",
+                points=points,
+            )
+            await callback.message.edit_text(
+                f"🎉 Тренировка завершена!\nОчки начислены: {points}"
+            )
         await callback.message.answer("Меню обновлено.", reply_markup=menu_for_user(user))
         await callback.answer("Отлично!")
         return
 
     text = compose_workout_text(today, exercises)
-    await callback.message.edit_text(text, reply_markup=exercises_keyboard(exercises, completed))
+    await callback.message.edit_text(
+        text, reply_markup=exercises_keyboard(exercises, completed, session=callback_data.session)
+    )
     await callback.answer("Обновлено")
 
 
@@ -634,15 +817,17 @@ async def scheduled_push(bot: Bot, chat_id: int) -> None:
         return
     today = dt.date.today()
     close_previous_day_if_pending(user["id"], today)
-    plan = database.get_plan_for_day(user["id"], weekday_key(today))
+    plan = database.get_plan_for_date(user_id=user["id"], target_date=today, start_date=user["plan_start_date"])
     existing_log = database.load_daily_log(user_id=user["id"], date=today.isoformat())
     if plan is None:
         await safe_send(bot, chat_id, "План недоступен, выполняй запасную тренировку.")
-        exercises = existing_log["exercises_done"] if existing_log and existing_log.get("exercises_done") else FALLBACK_WORKOUT
+        exercises = _log_exercises(existing_log) if existing_log else FALLBACK_WORKOUT
     else:
         is_rest, exercises = plan
-        if existing_log and existing_log.get("exercises_done"):
-            exercises = existing_log["exercises_done"]
+        if existing_log:
+            stored = _log_exercises(existing_log)
+            if stored:
+                exercises = stored
         if is_rest:
             await safe_send(bot, chat_id, "Сегодня отдых, восстанавливай силы!")
             return
