@@ -11,10 +11,6 @@ class ExerciseCallback(CallbackData, prefix="ex"):
     completed: bool
 
 
-class DifficultyCallback(CallbackData, prefix="df"):
-    rate: str
-
-
 class SettingsCallback(CallbackData, prefix="st"):
     action: str
 
@@ -42,15 +38,6 @@ def exercises_keyboard(exercises: list[dict[str, str | int]], completed: list[bo
         builder.button(text=label, callback_data=ExerciseCallback(index=idx, completed=not completed[idx]))
     builder.button(text="🚫 Пропустить день", callback_data=ExerciseCallback(index=-1, completed=False))
     builder.adjust(1)
-    return builder.as_markup()
-
-
-def difficulty_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🟢 Легко", callback_data=DifficultyCallback(rate="easy"))
-    builder.button(text="🟡 Норм", callback_data=DifficultyCallback(rate="normal"))
-    builder.button(text="🔴 Тяжело", callback_data=DifficultyCallback(rate="hard"))
-    builder.adjust(3)
     return builder.as_markup()
 
 
