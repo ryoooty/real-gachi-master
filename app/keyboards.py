@@ -15,12 +15,20 @@ class DifficultyCallback(CallbackData, prefix="df"):
     rate: str
 
 
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
+class SettingsCallback(CallbackData, prefix="st"):
+    action: str
+
+
+class ProfileCallback(CallbackData, prefix="pf"):
+    action: str
+
+
+def main_menu_keyboard(plan_label: str = "📅 План на сегодня") -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📅 План на сегодня"), KeyboardButton(text="📈 Статистика")],
-            [KeyboardButton(text="👤 Мой Профиль"), KeyboardButton(text="⚙️ Настройки")],
-            [KeyboardButton(text="✏️ Изменить профиль")],
+            [KeyboardButton(text=plan_label)],
+            [KeyboardButton(text="📈 Статистика")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="⚙️ Настройки")],
         ],
         resize_keyboard=True,
     )
@@ -43,4 +51,31 @@ def difficulty_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="🟡 Норм", callback_data=DifficultyCallback(rate="normal"))
     builder.button(text="🔴 Тяжело", callback_data=DifficultyCallback(rate="hard"))
     builder.adjust(3)
+    return builder.as_markup()
+
+
+def settings_keyboard(mode: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=("✅ ⏰ Точное время" if mode == "fixed" else "⏰ Точное время"),
+        callback_data=SettingsCallback(action="fixed"),
+    )
+    builder.button(
+        text=("✅ 🔁 Диапазон" if mode == "range" else "🔁 Диапазон"),
+        callback_data=SettingsCallback(action="range"),
+    )
+    builder.button(text="🌐 Часовой пояс", callback_data=SettingsCallback(action="timezone"))
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def profile_keyboard(weight: int | None, height: int | None) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Изменить профиль", callback_data=ProfileCallback(action="all"))
+    weight_label = f"{weight} кг" if weight is not None else "Вес?"
+    height_label = f"{height} см" if height is not None else "Рост?"
+    builder.button(text=weight_label, callback_data=ProfileCallback(action="weight"))
+    builder.button(text=height_label, callback_data=ProfileCallback(action="height"))
+    builder.button(text="Ник", callback_data=ProfileCallback(action="nickname"))
+    builder.adjust(1, 2, 1)
     return builder.as_markup()
