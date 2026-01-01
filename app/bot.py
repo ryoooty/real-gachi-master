@@ -850,7 +850,11 @@ async def scheduled_push(bot: Bot, chat_id: int) -> None:
     if existing_log and existing_log.get("points"):
         return
     completed = [ex.get("done", False) for ex in exercises]
-    database.update_daily_log(user_id=user["id"], date=today.isoformat(), exercises_done=exercises)
+    database.update_daily_log(
+        user_id=user["id"],
+        date=today.isoformat(),
+        exercises_done=_store_log_exercises(existing_log, "main", exercises),
+    )
     text = compose_workout_text(today, exercises)
     await safe_send(bot, chat_id, text, reply_markup=exercises_keyboard(exercises, completed))
 
