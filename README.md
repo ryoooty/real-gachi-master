@@ -14,6 +14,27 @@ pip install -r requirements.txt
 python -m app.bot  # В main() используется токен-заглушка, подставьте свой
 ```
 
+### Windows без виртуального окружения
+
+1. Убедитесь, что установлен Python 3.10+ (python.org или Microsoft Store).
+2. В командной строке (cmd/PowerShell) перейдите в папку проекта и установите зависимости сразу в глобальную среду пользователя:
+   ```powershell
+   pip install --user -r requirements.txt
+   ```
+3. Пропишите токен бота в переменной окружения (в PowerShell):
+   ```powershell
+   setx BOT_TOKEN "123:ABC"
+   ```
+   Перезапустите терминал, чтобы переменная подтянулась.
+4. Запустите бота:
+   ```powershell
+   python -m app.bot
+   ```
+5. Если увидите ошибку про часовые пояса (`zoneinfo`), установите данные зон:
+   ```powershell
+   pip install --user tzdata
+   ```
+
 ## Основные файлы
 
 - `app/database.py` — создание схемы и доступ к таблицам `users`, `weekly_plan`, `daily_logs`.
