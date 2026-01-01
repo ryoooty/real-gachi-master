@@ -19,5 +19,9 @@ def convert_local_time_to_utc(time_str: str, timezone: str | None = None) -> str
     return utc_time.strftime("%H:%M")
 
 
+def convert_range_to_utc(start: str, end: str, timezone: str | None = None) -> tuple[str, str]:
+    return convert_local_time_to_utc(start, timezone), convert_local_time_to_utc(end, timezone)
+
+
 def utc_now_time_str() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%H:%M")

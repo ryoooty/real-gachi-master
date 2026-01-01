@@ -20,6 +20,14 @@ def get_conn() -> Iterable[sqlite3.Connection]:
         conn.close()
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(%s)" % table)
+    columns = {row[1] for row in cursor.fetchall()}
+    if column not in columns:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with get_conn() as conn:
@@ -30,6 +38,9 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER UNIQUE,
                 notify_time_utc TEXT,
+                notify_range_start_utc TEXT,
+                notify_range_end_utc TEXT,
+                notify_mode TEXT DEFAULT 'fixed',
                 timezone TEXT DEFAULT 'Europe/Moscow',
                 weight INTEGER,
                 height INTEGER,
@@ -38,7 +49,7 @@ def init_db() -> None:
                 injuries TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
-            """
+            """,
         )
         cursor.execute(
             """
@@ -50,7 +61,7 @@ def init_db() -> None:
                 is_rest_day INTEGER DEFAULT 0,
                 UNIQUE(user_id, day_of_week)
             );
-            """
+            """,
         )
         cursor.execute(
             """
@@ -63,8 +74,12 @@ def init_db() -> None:
                 points INTEGER DEFAULT 0,
                 UNIQUE(user_id, date)
             );
-            """
+            """,
         )
+        # migrations for existing databases
+        _ensure_column(conn, "users", "notify_range_start_utc", "TEXT")
+        _ensure_column(conn, "users", "notify_range_end_utc", "TEXT")
+        _ensure_column(conn, "users", "notify_mode", "TEXT DEFAULT 'fixed'")
 
 
 def upsert_user(chat_id: int, **kwargs: Any) -> None:
@@ -86,6 +101,20 @@ def get_user(chat_id: int) -> Optional[sqlite3.Row]:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
         return cursor.fetchone()
+
+
+def list_users() -> List[sqlite3.Row]:
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users ORDER BY id ASC")
+        return cursor.fetchall()
+
+
+def get_user_count() -> int:
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        return int(cursor.fetchone()[0])
 
 
 def save_weekly_plan(user_id: int, plan: Dict[str, Any]) -> None:
@@ -167,3 +196,37 @@ def add_points(user_id: int, date: str, points: int) -> None:
             "UPDATE daily_logs SET points = COALESCE(points, 0) + ? WHERE user_id = ? AND date = ?",
             (points, user_id, date),
         )
+
+
+def total_points(user_id: int) -> int:
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT SUM(points) FROM daily_logs WHERE user_id = ?", (user_id,))
+        res = cursor.fetchone()[0]
+        return int(res or 0)
+
+
+def completion_dates(user_id: int) -> List[str]:
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT date, points FROM daily_logs WHERE user_id = ? AND COALESCE(points,0) > 0 ORDER BY date DESC",
+            (user_id,),
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+
+def leaderboard() -> List[tuple[int, int]]:
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT chat_id, COALESCE(SUM(points),0) as pts
+            FROM daily_logs
+            JOIN users ON users.id = daily_logs.user_id
+            GROUP BY chat_id
+            ORDER BY pts DESC
+            """
+        )
+        return [(row[0], row[1]) for row in cursor.fetchall()]
+
