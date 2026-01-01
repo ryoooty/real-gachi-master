@@ -15,6 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, TelegramObject
 from aiogram import BaseMiddleware
+import pytz
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
@@ -508,7 +509,10 @@ async def on_startup(bot: Bot, scheduler: WorkoutScheduler) -> None:
         _schedule_user_from_row(scheduler, user)
     scheduler.start()
     # weekly generation every Sunday 18:00 UTC
-    scheduler.scheduler.add_job(lambda: asyncio.create_task(generate_all(bot)), CronTrigger(day_of_week="sun", hour=18, minute=0))
+    scheduler.scheduler.add_job(
+        lambda: asyncio.create_task(generate_all(bot)),
+        CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=pytz.UTC),
+    )
 
 
 async def generate_all(bot: Bot) -> None:
