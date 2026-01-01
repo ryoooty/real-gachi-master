@@ -16,16 +16,13 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, TelegramObject, ReplyKeyboardMarkup
 from aiogram import BaseMiddleware
 import pytz
-from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
-from app import ai, database
+from app import database
 from app.keyboards import (
-    DifficultyCallback,
     ExerciseCallback,
     ProfileCallback,
     SettingsCallback,
-    difficulty_keyboard,
     exercises_keyboard,
     main_menu_keyboard,
     profile_keyboard,
@@ -65,8 +62,6 @@ class ProfileStates(StatesGroup):
     weight = State()
     height = State()
     age = State()
-    level = State()
-    injuries = State()
 
 
 class SettingsStates(StatesGroup):
@@ -133,7 +128,7 @@ def validate_time(text: str) -> bool:
 def profile_ready(user: sqlite3.Row) -> bool:
     record = dict(user)
     return all(
-        record.get(field) is not None for field in ("nickname", "weight", "height", "age", "level", "injuries")
+        record.get(field) is not None for field in ("nickname", "weight", "height", "age")
     )
 
 
@@ -156,8 +151,7 @@ def format_profile(user: sqlite3.Row) -> str:
         f"{nickname}\n\n"
         f"Вин-стрик: {streak} дней\n"
         f"Всего выполнено дней: {completed_days}\n"
-        f"Очки: {total_points_value}\n"
-        f"Ограничения: {user['injuries'] or 'нет'}"
+        f"Очки: {total_points_value}"
     )
 
 
@@ -382,30 +376,14 @@ async def set_age(message: Message, state: FSMContext) -> None:
     if age is None:
         await message.answer("Нужно число. Введи возраст:")
         return
-    await state.update_data(age=age)
-    await state.set_state(ProfileStates.level)
-    await message.answer("Укажи уровень (Новичок или Про). Если не нужен, напиши 'не нужен'.")
-
-
-@router.message(ProfileStates.level)
-async def set_level(message: Message, state: FSMContext) -> None:
-    await state.update_data(level=message.text)
-    await state.set_state(ProfileStates.injuries)
-    await message.answer("Есть ли травмы или ограничения?")
-
-
-@router.message(ProfileStates.injuries)
-async def finish_profile(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    data["injuries"] = message.text
+    data["age"] = age
     database.upsert_user(
         message.chat.id,
         nickname=data.get("nickname"),
         weight=data.get("weight"),
         height=data.get("height"),
         age=data.get("age"),
-        level=data.get("level"),
-        injuries=data.get("injuries"),
     )
     await state.clear()
     user = database.get_user(message.chat.id)
@@ -545,7 +523,7 @@ async def today_plan(message: Message, state: FSMContext) -> None:
         await message.answer("Тренировка за сегодня уже сохранена.", reply_markup=menu_for_user(user))
         return
     if plan is None:
-        await message.answer("План кончился! Выполняем запасную тренировку.")
+        await message.answer("План недоступен, выполняем запасную тренировку.")
     if is_rest:
         await message.answer("Сегодня отдых, восстанавливай силы!")
         return
@@ -596,41 +574,24 @@ async def handle_exercise_callback(callback: CallbackQuery, callback_data: Exerc
     database.update_daily_log(user_id=user["id"], date=today.isoformat(), exercises_done=exercises)
 
     if all_done:
-        await callback.message.edit_text(
-            "🎉 Тренировка завершена!\nОценка сложности:", reply_markup=difficulty_keyboard()
+        points = sum(3 if ex.get("name", "").lower().startswith("pull") else 1 for ex in exercises if ex.get("done"))
+        database.update_daily_log(
+            user_id=user["id"],
+            date=today.isoformat(),
+            exercises_done=exercises,
+            difficulty_rate="completed",
+            points=points,
         )
+        await callback.message.edit_text(
+            f"🎉 Тренировка завершена!\nОчки начислены: {points}"
+        )
+        await callback.message.answer("Меню обновлено.", reply_markup=menu_for_user(user))
         await callback.answer("Отлично!")
         return
 
     text = compose_workout_text(today, exercises)
     await callback.message.edit_text(text, reply_markup=exercises_keyboard(exercises, completed))
     await callback.answer("Обновлено")
-
-
-@router.callback_query(DifficultyCallback.filter())
-async def handle_difficulty_callback(callback: CallbackQuery, callback_data: DifficultyCallback) -> None:
-    user = database.get_user(callback.message.chat.id)
-    if not user:
-        await callback.answer("Нет профиля")
-        return
-    today = dt.date.today().isoformat()
-    log = database.load_daily_log(user_id=user["id"], date=today)
-    if not log:
-        await callback.answer("Нет тренировки")
-        return
-
-    exercises = log["exercises_done"]
-    points = sum(3 if ex.get("name", "").lower().startswith("pull") else 1 for ex in exercises if ex.get("done"))
-    database.update_daily_log(
-        user_id=user["id"],
-        date=today,
-        exercises_done=exercises,
-        difficulty_rate=callback_data.rate,
-        points=points,
-    )
-    await callback.message.edit_text("Сложность сохранена, очки начислены!")
-    await callback.message.answer("Меню обновлено.", reply_markup=menu_for_user(user))
-    await callback.answer("Спасибо за отзыв")
 
 
 @router.message(StateFilter("*"), F.text == "📈 Статистика")
@@ -667,35 +628,6 @@ async def show_stats(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(Command("generate"))
-async def manual_generate(message: Message) -> None:
-    await weekly_generation(message.chat.id)
-    await message.answer("Сформирован новый недельный план.")
-
-
-async def weekly_generation(chat_id: int) -> None:
-    user = database.get_user(chat_id)
-    if not user:
-        return
-    completion_dates = database.completion_dates(user["id"])
-    completion_rate = min(100, len(completion_dates) * 100 // 7) if completion_dates else 0
-    last_difficulty = database.load_daily_log(user["id"], dt.date.today().isoformat()) or {}
-    perceived = last_difficulty.get("difficulty_rate") or "normal"
-    profile = ai.UserProfile(
-        weight=user["weight"] or 80,
-        height=user["height"] or 180,
-        age=user["age"] or 25,
-        level=user["level"] or "Новичок",
-        injuries=user["injuries"] or "нет",
-        completion_rate=completion_rate,
-        perceived_difficulty=perceived,
-    )
-    client = ai.DeepSeekClient()
-    raw_plan = client.generate_weekly_plan(profile)
-    adjusted = ai.adjust_plan(raw_plan, perceived)
-    client.persist_weekly_plan(chat_id, adjusted)
-
-
 async def scheduled_push(bot: Bot, chat_id: int) -> None:
     user = database.get_user(chat_id)
     if not user:
@@ -705,7 +637,7 @@ async def scheduled_push(bot: Bot, chat_id: int) -> None:
     plan = database.get_plan_for_day(user["id"], weekday_key(today))
     existing_log = database.load_daily_log(user_id=user["id"], date=today.isoformat())
     if plan is None:
-        await safe_send(bot, chat_id, "План кончился! Жми кнопку генерации или выполняй запасную тренировку.")
+        await safe_send(bot, chat_id, "План недоступен, выполняй запасную тренировку.")
         exercises = existing_log["exercises_done"] if existing_log and existing_log.get("exercises_done") else FALLBACK_WORKOUT
     else:
         is_rest, exercises = plan
@@ -751,17 +683,6 @@ async def on_startup(bot: Bot, scheduler: WorkoutScheduler) -> None:
     for user in database.list_users():
         _schedule_user_from_row(scheduler, user)
     scheduler.start()
-    # weekly generation every Sunday 18:00 UTC
-    scheduler.scheduler.add_job(
-        lambda: asyncio.create_task(generate_all(bot)),
-        CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=pytz.UTC),
-    )
-
-
-async def generate_all(bot: Bot) -> None:
-    for user in database.list_users():
-        await weekly_generation(user["chat_id"])
-        await safe_send(bot, user["chat_id"], "Новая недельная программа сгенерирована.")
 
 
 async def main() -> None:
