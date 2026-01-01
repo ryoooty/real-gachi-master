@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import datetime as dt
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -38,8 +39,11 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER UNIQUE,
                 notify_time_utc TEXT,
+                notify_time_utc_iso TEXT,
                 notify_range_start_utc TEXT,
                 notify_range_end_utc TEXT,
+                notify_range_start_utc_iso TEXT,
+                notify_range_end_utc_iso TEXT,
                 notify_mode TEXT DEFAULT 'fixed',
                 timezone TEXT DEFAULT 'Europe/Moscow',
                 weight INTEGER,
@@ -80,6 +84,9 @@ def init_db() -> None:
         _ensure_column(conn, "users", "notify_range_start_utc", "TEXT")
         _ensure_column(conn, "users", "notify_range_end_utc", "TEXT")
         _ensure_column(conn, "users", "notify_mode", "TEXT DEFAULT 'fixed'")
+        _ensure_column(conn, "users", "notify_time_utc_iso", "TEXT")
+        _ensure_column(conn, "users", "notify_range_start_utc_iso", "TEXT")
+        _ensure_column(conn, "users", "notify_range_end_utc_iso", "TEXT")
 
 
 def upsert_user(chat_id: int, **kwargs: Any) -> None:
@@ -204,6 +211,41 @@ def total_points(user_id: int) -> int:
         cursor.execute("SELECT SUM(points) FROM daily_logs WHERE user_id = ?", (user_id,))
         res = cursor.fetchone()[0]
         return int(res or 0)
+
+
+def completed_days(user_id: int) -> int:
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM daily_logs WHERE user_id = ? AND COALESCE(points,0) > 0",
+            (user_id,),
+        )
+        res = cursor.fetchone()[0]
+        return int(res or 0)
+
+
+def max_streak(user_id: int) -> int:
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT date FROM daily_logs WHERE user_id = ? AND COALESCE(points,0) > 0 ORDER BY date DESC",
+            (user_id,),
+        )
+        rows = [dt for (dt,) in cursor.fetchall()]
+    best = 0
+    current = 0
+    last_date = None
+    for iso in rows:
+        current_date = dt.datetime.fromisoformat(iso).date()
+        if last_date is None or last_date - dt.timedelta(days=1) == current_date:
+            current += 1
+        elif last_date == current_date:
+            continue
+        else:
+            current = 1
+        best = max(best, current)
+        last_date = current_date
+    return best
 
 
 def completion_dates(user_id: int) -> List[str]:

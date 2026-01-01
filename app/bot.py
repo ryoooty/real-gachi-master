@@ -28,7 +28,7 @@ from app.keyboards import (
     main_menu_keyboard,
 )
 from app.scheduler import WorkoutScheduler
-from app.time_utils import convert_local_time_to_utc, utc_now_time_str
+from app.time_utils import convert_local_time_to_utc, convert_range_to_utc
 
 load_dotenv()
 
@@ -198,7 +198,12 @@ async def start(message: Message, state: FSMContext, scheduler: WorkoutScheduler
         if database.get_user_count() >= MAX_USERS:
             await message.answer("Мест нет. Бот работает только для двух пользователей.")
             return
-        database.upsert_user(message.chat.id, notify_time_utc=utc_now_time_str())
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        database.upsert_user(
+            message.chat.id,
+            notify_time_utc=now_utc.strftime("%H:%M"),
+            notify_time_utc_iso=now_utc.isoformat(),
+        )
     await state.clear()
     await message.answer(
         "Привет! Я помогу планировать тренировки. Используй меню ниже, чтобы начать.",
@@ -336,13 +341,17 @@ async def set_fixed_time(message: Message, state: FSMContext, scheduler: Workout
     if not user:
         await message.answer("Сначала профиль.")
         return
-    utc_time = convert_local_time_to_utc(message.text, user["timezone"])
+    utc_dt = convert_local_time_to_utc(message.text, user["timezone"])
+    utc_time = utc_dt.strftime("%H:%M")
     database.upsert_user(
         message.chat.id,
         notify_time_utc=utc_time,
+        notify_time_utc_iso=utc_dt.isoformat(),
         notify_mode="fixed",
         notify_range_start_utc=None,
         notify_range_end_utc=None,
+        notify_range_start_utc_iso=None,
+        notify_range_end_utc_iso=None,
     )
     _schedule_user_from_row(scheduler, database.get_user(message.chat.id))
     await state.clear()
@@ -370,13 +379,16 @@ async def set_range_end(message: Message, state: FSMContext, scheduler: WorkoutS
     if not user:
         await message.answer("Сначала профиль.")
         return
-    start_utc = convert_local_time_to_utc(start_local, user["timezone"])
-    end_utc = convert_local_time_to_utc(message.text, user["timezone"])
+    start_utc_dt, end_utc_dt = convert_range_to_utc(start_local, message.text, user["timezone"])
+    start_utc = start_utc_dt.strftime("%H:%M")
+    end_utc = end_utc_dt.strftime("%H:%M")
     database.upsert_user(
         message.chat.id,
         notify_mode="range",
         notify_range_start_utc=start_utc,
         notify_range_end_utc=end_utc,
+        notify_range_start_utc_iso=start_utc_dt.isoformat(),
+        notify_range_end_utc_iso=end_utc_dt.isoformat(),
     )
     _schedule_user_from_row(scheduler, database.get_user(message.chat.id))
     await state.clear()
@@ -437,6 +449,7 @@ async def handle_exercise_callback(callback: CallbackQuery, callback_data: Exerc
             await callback.answer("Тренировка уже завершена")
             return
         text = "День пропущен. Не забывай вернуться завтра!"
+        keep_points = log.get("points", 0)
         database.update_daily_log(
             user_id=user["id"],
             date=today.isoformat(),
@@ -572,14 +585,23 @@ def _schedule_user_from_row(scheduler: WorkoutScheduler, user_row) -> None:
         return
     mode = user_row["notify_mode"] or "fixed"
     if mode == "range" and user_row["notify_range_start_utc"] and user_row["notify_range_end_utc"]:
-        scheduler.schedule_range(
-            chat_id=user_row["chat_id"],
-            start_local=user_row["notify_range_start_utc"],
-            end_local=user_row["notify_range_end_utc"],
-            timezone="UTC",
-        )
+        if user_row["notify_range_start_utc_iso"] and user_row["notify_range_end_utc_iso"]:
+            start_dt = dt.datetime.fromisoformat(user_row["notify_range_start_utc_iso"]).astimezone(dt.timezone.utc)
+            end_dt = dt.datetime.fromisoformat(user_row["notify_range_end_utc_iso"]).astimezone(dt.timezone.utc)
+            scheduler._range_job(chat_id=user_row["chat_id"], start_utc=start_dt, end_utc=end_dt)
+        else:
+            scheduler.schedule_range(
+                chat_id=user_row["chat_id"],
+                start_local=user_row["notify_range_start_utc"],
+                end_local=user_row["notify_range_end_utc"],
+                timezone="UTC",
+            )
     elif user_row["notify_time_utc"]:
-        scheduler.schedule_fixed(chat_id=user_row["chat_id"], local_time=user_row["notify_time_utc"], timezone="UTC")
+        if user_row["notify_time_utc_iso"]:
+            parsed = dt.datetime.fromisoformat(user_row["notify_time_utc_iso"]).astimezone(dt.timezone.utc)
+            scheduler.schedule_fixed(chat_id=user_row["chat_id"], local_time=parsed.strftime("%H:%M"), timezone="UTC")
+        else:
+            scheduler.schedule_fixed(chat_id=user_row["chat_id"], local_time=user_row["notify_time_utc"], timezone="UTC")
 
 
 async def on_startup(bot: Bot, scheduler: WorkoutScheduler) -> None:
