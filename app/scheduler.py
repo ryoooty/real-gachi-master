@@ -18,22 +18,21 @@ class WorkoutScheduler:
         self.on_trigger = on_trigger
 
     def schedule_fixed(self, chat_id: int, local_time: str, timezone: str | None = None) -> None:
-        utc_time = convert_local_time_to_utc(local_time, timezone)
-        hour, minute = map(int, utc_time.split(":"))
-        trigger = CronTrigger(hour=hour, minute=minute, timezone=pytz.UTC)
-        self.scheduler.add_job(self._wrap(chat_id, mode="fixed"), trigger, id=f"notify-{chat_id}", replace_existing=True)
+        utc_dt = convert_local_time_to_utc(local_time, timezone)
+        trigger = CronTrigger(hour=utc_dt.hour, minute=utc_dt.minute, timezone=pytz.UTC)
+        next_run = utc_dt if utc_dt > dt.datetime.now(pytz.UTC) else None
+        self.scheduler.add_job(
+            self._wrap(chat_id, mode="fixed"),
+            trigger,
+            id=f"notify-{chat_id}",
+            replace_existing=True,
+            next_run_time=next_run,
+        )
 
-    def _range_job(self, chat_id: int, start_utc: str, end_utc: str) -> None:
-        start_hour, start_min = map(int, start_utc.split(":"))
-        end_hour, end_min = map(int, end_utc.split(":"))
+    def _range_job(self, chat_id: int, start_utc: dt.datetime, end_utc: dt.datetime) -> None:
         now = dt.datetime.now(pytz.UTC)
-        today = now.date()
-
-        start_dt = dt.datetime.combine(today, dt.time(start_hour, start_min, tzinfo=pytz.UTC))
-        end_dt = dt.datetime.combine(today, dt.time(end_hour, end_min, tzinfo=pytz.UTC))
-        if end_dt <= start_dt:
-            end_dt += dt.timedelta(days=1)
-
+        start_dt = start_utc
+        end_dt = end_utc
         if now >= end_dt:
             start_dt += dt.timedelta(days=1)
             end_dt += dt.timedelta(days=1)
@@ -59,7 +58,9 @@ class WorkoutScheduler:
         if self.scheduler.running:
             self.scheduler.shutdown()
 
-    def _wrap(self, chat_id: int, mode: str, start: Optional[str] = None, end: Optional[str] = None) -> Callable[[], Awaitable[None]]:
+    def _wrap(
+        self, chat_id: int, mode: str, start: Optional[dt.datetime] = None, end: Optional[dt.datetime] = None
+    ) -> Callable[[], Awaitable[None]]:
         async def job() -> None:
             await self.on_trigger(chat_id)
             if mode == "range" and start and end:

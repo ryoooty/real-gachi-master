@@ -7,20 +7,31 @@ from zoneinfo import ZoneInfo
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
-def convert_local_time_to_utc(time_str: str, timezone: str | None = None) -> str:
-    """Convert HH:MM in provided timezone to UTC HH:MM string.
-
-    The conversion relies on datetime and ZoneInfo to safely cross day boundaries
-    without manual arithmetic.
-    """
+def _normalize_local_datetime(time_str: str, timezone: str | None = None) -> dt.datetime:
     tzinfo = ZoneInfo(timezone or "Europe/Moscow")
-    local_time = dt.datetime.combine(dt.date.today(), dt.time.fromisoformat(time_str), tzinfo)
-    utc_time = local_time.astimezone(dt.timezone.utc)
-    return utc_time.strftime("%H:%M")
+    now_local = dt.datetime.now(tzinfo)
+    candidate = dt.datetime.combine(now_local.date(), dt.time.fromisoformat(time_str), tzinfo)
+    if candidate <= now_local:
+        candidate += dt.timedelta(days=1)
+    return candidate
 
 
-def convert_range_to_utc(start: str, end: str, timezone: str | None = None) -> tuple[str, str]:
-    return convert_local_time_to_utc(start, timezone), convert_local_time_to_utc(end, timezone)
+def convert_local_time_to_utc(time_str: str, timezone: str | None = None) -> dt.datetime:
+    """Convert HH:MM in provided timezone to next UTC datetime.
+
+    Returns a timezone-aware datetime to keep the exact date when converting
+    across day boundaries (e.g. 23:30 in UTC+12 should become previous UTC day).
+    """
+    local_dt = _normalize_local_datetime(time_str, timezone)
+    return local_dt.astimezone(dt.timezone.utc)
+
+
+def convert_range_to_utc(start: str, end: str, timezone: str | None = None) -> tuple[dt.datetime, dt.datetime]:
+    start_dt = _normalize_local_datetime(start, timezone)
+    end_dt = dt.datetime.combine(start_dt.date(), dt.time.fromisoformat(end), start_dt.tzinfo)
+    if end_dt <= start_dt:
+        end_dt += dt.timedelta(days=1)
+    return start_dt.astimezone(dt.timezone.utc), end_dt.astimezone(dt.timezone.utc)
 
 
 def utc_now_time_str() -> str:
